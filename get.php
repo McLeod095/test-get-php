@@ -47,244 +47,212 @@ fclose($procCheck);
 
 
 
-if(php_sapi_name() != 'cli')
-{	
-	if(empty($_GET) && empty($_POST))
+if(empty($_GET) && empty($_POST))
+{
+	print json_encode(array("error"=>"Not enough parameters"));
+}
+else if($_GET['function'] != 'Test' && (checkIpAccess($ip) || $_GET['function'] == 'Getter'))
+{
+	//doing memcheck after the web script, so we won't get bugged down by bad ips and haproxy monitors
+	//memory is in Kb
+	$memCheck=fopen("/tmp/memCheck.lock", 'w');
+	if(flock($memCheck, LOCK_EX))
 	{
-		print json_encode(array("error"=>"Not enough parameters"));
-	}
-	else if($_GET['function'] != 'Test' && (checkIpAccess($ip) || $_GET['function'] == 'Getter'))
-	{
-		unset($_GET['monitor']);
-		$name="scraper_".getmypid()."_".time()."_".md5(implode("", $_GET).implode("",$_SERVER));
-		$fh=fopen("/tmp/$name", "w");
-		if(flock($fh, LOCK_EX))
+		$mem=file_get_contents("/proc/meminfo");
+		$mem=explode(PHP_EOL, $mem);
+		foreach($mem as $memLine)
 		{
-			$data=array("GET"=>$_GET, "SERVER"=>$_SERVER, "POST"=>$_POST);
-			fwrite($fh, serialize($data));
-			flock($fh, LOCK_UN);
-			fclose($fh);
-			exec("php ".__DIR__."/get.php file $name >/tmp/".$name.".json &");
-			//wait for it to start up
-			sleep(5);
-			$pid=file_get_contents("/tmp/".$name.".pid");
-			if($pid)
+			if(stripos($memLine, "MemFree") !== FALSE)
 			{
-				monitorScraper($pid, $name, 200);
-			}
+				$memLine=preg_replace("/\s+/", " ", $memLine);
+				$memLine=explode(" ", $memLine);
+				if(isset($memLine[1]))
+				{
+					$freeMem=intval($memLine[1]);
+					//less than 50mb
+					if($freeMem < 100)
+					{
+						print json_encode(array("error"=>"Not enough memory ".$freeMem));
+						flock($memCheck, LOCK_UN);
+						fclose($memCheck);
+						exit();
+					}
+				}
+				break;
+			}	
 		}
+		flock($memCheck, LOCK_UN);
+	}
+	fclose($memCheck);
+	
+	require_once "Configurator/Configurator.php";
+	require_once "StoreParsing/StoreParsing.php";
+	require_once "StoreParsing/Getter/Getter.php";
+
+	require_once __DIR__."/extra_func.php";
+	require_once __DIR__."/DBC/amazon.php";
+
+	loadConfig(__DIR__."/configuration.ini");
+	
+	$startTime=time();
+	setConfig('StartTime', $startTime);
+	setConfig('DEBUG', false);
+	setConfig('ALLOWCACHE', true);
+	//we allow cache, so that if scraper requires multiple calls to process on page, it would work, 
+	//but set it to expire in 2 minutes
+	setConfig('keepCacheFor', 2);
+	setConfig('noProxy', true);
+
+	$memCache = false;
+	
+	/**** TESTING PURPOSES ***/
+	if(isset($_GET['test']) && (bool)$_GET['test'])
+	{
+		setConfig('DEBUG', true);
+		$_SERVER['REMOTE_ADDR']="127.0.0.1";
+		$_POST['json']=json_encode(array(	//getPriceStock, getVariations, getOffers, getProduct, getItems, getSearch, getStockQuantity
+											"function" => "getItems", 
+											"store" => "amazon", 
+											//sku, url or keyword (for search)
+											"param" => "http://www.amazon.com/s/ref=sr_st_popularity-rank?lo=hpc&keywords=-asdafsdf&qid=1423266662&rh=n%3A3760901%2Ck%3A-asdafsdf&sort=popularity-rank", 
+											//proxy can also be forced, just pass "ip:port as proxy parameter"
+											"proxy" => "true"));
+	}
+	
+	if(isset($_GET['debug']))
+	{
+		print "<pre>";
+		setConfig('DEBUG', true);
+	}
+	if(!isset($_POST['json']))
+	{
+
+		$_POST['json']=json_encode($_GET);
+	}
+	//for casper
+	if(!isset($_POST["js"])) $_POST["js"]=false;
+
+
+	//do without ip check for now, since do direct call from scraper
+	if(isset($_GET['function']) && $_GET['function'] == 'Getter')
+	{
+		print processGetter($_GET);
+		exit();
+	}
+
+	if(getConfig('DEBUG')) print date("H:i:s").": checking IP access\n";
+	if(checkIpAccess($ip))
+	{
+		if(getConfig('DEBUG')) print date("H:i:s").": checking request\n";
+
+		if(checkRequest($_POST['json']))
+		{		
+			addStat("requested");
+
+			if(getConfig('DEBUG')) print date("H:i:s").": starting to process request\n";
+			$ret=processRequest($_POST['json'], $_POST['js']);
+			if(!$ret) $ret=array("error"=>"error");
+
+			if(getConfig('DEBUG')) print_r($ret);
+			$ret=fixJson($ret);
+			$output=json_encode($ret);
+			//temp fix for bad unicode characters
+			//$output=str_replace("null:", '"null":', $output);
+			$output=str_replace("null", '""', $output);
+			$output=str_replace('""""', '""', $output);
+
+			print $output;
+
+			if(getConfig('DEBUG')) print "\n";
+		}
+		else if(isset($_GET['stats']))
+		{
+			$stats=getStats(array("requested", "parsed"));
+			if(isset($_GET['format']))
+			{
+				print "<pre>";
+				print_r($stats);
+				print "<pre>";
+			}
+			else print json_encode($stats);
+		}
+		else if(isset($_GET['stats_reset']))
+		{
+			$stats=getStats(array("requested", "parsed"), true);
+			if(isset($_GET['format']))
+			{
+				print "<pre>";
+				print_r($stats);
+				print "<pre>";
+			}
+			else print json_encode($stats);
+		}
+		else if(isset($_GET['stats_stores']))
+		{
+			$stats=getStatsStores();
+			if(isset($_GET['format']))
+			{
+				print "<pre>";
+				print_r($stats);
+				print "<pre>";
+			}
+			else print json_encode($stats);
+		}
+		//test only a subset of stores
+		else if(isset($_GET['stats_stores_part']))
+		{
+			$stats=getStatsStores(true);
+			if(isset($_GET['format']))
+			{
+				print "<pre>";
+				print_r($stats);
+				print "<pre>";
+			}
+			else print json_encode($stats);
+		}
+		else
+		{
+			$ret=array("error"=> "Malformed request\n<br>", $_POST['json']);
+			print json_encode($ret);
+		}
+
 	}
 	else
 	{
 		print json_encode(array("error"=>"$ip Not allowed here, visit us at <a href='http://skuio.com'>Sku IO</a><br>\n"));;
 	}
-	exit();
-}
-
-
-//doing memcheck after the web script, so we won't get bugged down by bad ips and haproxy monitors
-//memory is in Kb
-$memCheck=fopen("/tmp/memCheck.lock", 'w');
-if(flock($memCheck, LOCK_EX))
-{
-	$mem=file_get_contents("/proc/meminfo");
-	$mem=explode(PHP_EOL, $mem);
-	foreach($mem as $memLine)
-	{
-		if(stripos($memLine, "MemFree") !== FALSE)
-		{
-			$memLine=preg_replace("/\s+/", " ", $memLine);
-			$memLine=explode(" ", $memLine);
-			if(isset($memLine[1]))
-			{
-				$freeMem=intval($memLine[1]);
-				//less than 50mb
-				if($freeMem < 100)
-				{
-					print json_encode(array("error"=>"Not enough memory ".$freeMem));
-					flock($memCheck, LOCK_UN);
-					fclose($memCheck);
-					exit();
-				}
-			}
-			break;
-		}	
-	}
-	flock($memCheck, LOCK_UN);
-}
-fclose($memCheck);
-
-
-
-
-if(isset($argv[1]) && isset($argv[2]) && $argv[1] == "file")
-{
-	$name=$argv[2];
-	$data=file_get_contents("/tmp/$name");
-	file_put_contents("/tmp/".$name.".pid", getmypid());
-	$data=unserialize($data);
-	if(is_array($data))
-	{
-		$_GET=$data['GET'];
-		$_SERVER=$data['SERVER'];
-		$_POST=$data['POST'];
-		$ip=isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR']:$_SERVER['REMOTE_ADDR'];
-		
-	}
-	
-}
-
-
-
-
-
-
-require_once "Configurator/Configurator.php";
-require_once "StoreParsing/StoreParsing.php";
-require_once "StoreParsing/Getter/Getter.php";
-
-require_once __DIR__."/extra_func.php";
-require_once __DIR__."/DBC/amazon.php";
-
-loadConfig(__DIR__."/configuration.ini");
-
-//use cron for it
-if(time() % 20 == 0) exec("/bin/bash ".__DIR__."/isup.sh"); 
-
-$startTime=time();
-setConfig('StartTime', $startTime);
-setConfig('DEBUG', false);
-setConfig('ALLOWCACHE', true);
-//we allow cache, so that if scraper requires multiple calls to process on page, it would work, 
-//but set it to expire in 2 minutes
-setConfig('keepCacheFor', 2);
-setConfig('noProxy', true);
-
-$memCache = false;
-/*memcache
-$memCache = new Memcached(); 
-$memCache->addServer("localhost", 11211);
-$memCache->set("version", date ("F d Y H:i:s.", filemtime(__FILE__)));
-*/
-
-
-/**** TESTING PURPOSES ***/
-if(isset($argv[1]) && $argv[1] == "test")
-{
-	setConfig('DEBUG', true);
-	$_SERVER['REMOTE_ADDR']="127.0.0.1";
-	$_POST['json']=json_encode(array(	//getPriceStock, getVariations, getOffers, getProduct, getItems, getSearch, getStockQuantity
-										"function" => "getItems", 
-										"store" => "amazon", 
-										//sku, url or keyword (for search)
-										"param" => "http://www.amazon.com/s/ref=sr_st_popularity-rank?lo=hpc&keywords=-asdafsdf&qid=1423266662&rh=n%3A3760901%2Ck%3A-asdafsdf&sort=popularity-rank", 
-										//proxy can also be forced, just pass "ip:port as proxy parameter"
-										"proxy" => "true"));
-}
-if(isset($_GET['debug']))
-{
-	print "<pre>";
-	setConfig('DEBUG', true);
-}
-if(!isset($_POST['json']))
-{
-
-	$_POST['json']=json_encode($_GET);
-}
-//for casper
-if(!isset($_POST["js"])) $_POST["js"]=false;
-
-
-//do without ip check for now, since do direct call from scraper
-if(isset($_GET['function']) && $_GET['function'] == 'Getter')
-{
-	print processGetter($_GET);
-	exit();
-}
-
-if(getConfig('DEBUG')) print date("H:i:s").": checking IP access\n";
-if(checkIpAccess($ip))
-{
-	if(getConfig('DEBUG')) print date("H:i:s").": checking request\n";
-	
-	if(checkRequest($_POST['json']))
-	{		
-		addStat("requested");
-		
-		if(getConfig('DEBUG')) print date("H:i:s").": starting to process request\n";
-		$ret=processRequest($_POST['json'], $_POST['js']);
-		if(!$ret) $ret=array("error"=>"error");
-
-		if(getConfig('DEBUG')) print_r($ret);
-		$ret=fixJson($ret);
-		$output=json_encode($ret);
-		//temp fix for bad unicode characters
-		//$output=str_replace("null:", '"null":', $output);
-		$output=str_replace("null", '""', $output);
-		$output=str_replace('""""', '""', $output);
-		
-		print $output;
-		
-		if(getConfig('DEBUG')) print "\n";
-	}
-	else if(isset($_GET['stats']))
-	{
-		$stats=getStats(array("requested", "parsed"));
-		if(isset($_GET['format']))
-		{
-			print "<pre>";
-			print_r($stats);
-			print "<pre>";
-		}
-		else print json_encode($stats);
-	}
-	else if(isset($_GET['stats_reset']))
-	{
-		$stats=getStats(array("requested", "parsed"), true);
-		if(isset($_GET['format']))
-		{
-			print "<pre>";
-			print_r($stats);
-			print "<pre>";
-		}
-		else print json_encode($stats);
-	}
-	else if(isset($_GET['stats_stores']))
-	{
-		$stats=getStatsStores();
-		if(isset($_GET['format']))
-		{
-			print "<pre>";
-			print_r($stats);
-			print "<pre>";
-		}
-		else print json_encode($stats);
-	}
-	//test only a subset of stores
-	else if(isset($_GET['stats_stores_part']))
-	{
-		$stats=getStatsStores(true);
-		if(isset($_GET['format']))
-		{
-			print "<pre>";
-			print_r($stats);
-			print "<pre>";
-		}
-		else print json_encode($stats);
-	}
-	else
-	{
-		$ret=array("error"=> "Malformed request\n<br>", $_POST['json']);
-		print json_encode($ret);
-	}
-	
 }
 else
 {
 	print json_encode(array("error"=>"$ip Not allowed here, visit us at <a href='http://skuio.com'>Sku IO</a><br>\n"));;
 }
+// exit();
 
+// if(isset($argv[1]) && isset($argv[2]) && $argv[1] == "file")
+// {
+// 	$name=$argv[2];
+// 	$data=file_get_contents("/tmp/$name");
+// 	file_put_contents("/tmp/".$name.".pid", getmypid());
+// 	$data=unserialize($data);
+// 	if(is_array($data))
+// 	{
+// 		$_GET=$data['GET'];
+// 		$_SERVER=$data['SERVER'];
+// 		$_POST=$data['POST'];
+// 		$ip=isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR']:$_SERVER['REMOTE_ADDR'];
+		
+// 	}
+	
+// }
 
+//use cron for it
+if(time() % 20 == 0) exec("/bin/bash ".__DIR__."/isup.sh"); 
+
+/*memcache
+$memCache = new Memcached(); 
+$memCache->addServer("localhost", 11211);
+$memCache->set("version", date ("F d Y H:i:s.", filemtime(__FILE__)));
+*/
 
 $totalTime=time()-$startTime;
 $pid=getmypid();
